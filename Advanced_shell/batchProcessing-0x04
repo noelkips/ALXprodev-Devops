@@ -1,33 +1,20 @@
 #!/bin/bash
 
 # Parallel Pokemon Data Fetching Script
-# Fetches multiple Pokemon data simultaneously using background processes
-# Implements proper process management and synchronization
+# Uses background processes and jobs command for process management
 
 # Configuration
 POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
 API_BASE_URL="https://pokeapi.co/api/v2/pokemon"
 OUTPUT_DIR="pokemon_data"
-ERROR_LOG="parallel_errors.txt"
-SUCCESS_LOG="parallel_success.txt"
-PROCESS_LOG="process_status.txt"
-MAX_CONCURRENT=5  # Maximum number of parallel processes
-TIMEOUT=30        # Timeout for each request
-MAX_RETRIES=3     # Maximum retry attempts per Pokemon
 
-# Colors for output formatting
+# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-# Arrays to track processes
-declare -a PROCESS_PIDS=()
-declare -a PROCESS_NAMES=()
-declare -A PROCESS_STATUS=()
+NC='\033[0m'
 
 # Function to print colored output
 print_color() {
@@ -36,380 +23,116 @@ print_color() {
     echo -e "${color}${message}${NC}"
 }
 
-# Function to log with timestamp
-log_message() {
-    local log_file="$1"
-    local message="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] $message" >> "$log_file"
-}
-
-# Function to setup directories and files
+# Function to setup environment
 setup_environment() {
-    # Create output directory
     if [ ! -d "$OUTPUT_DIR" ]; then
         mkdir -p "$OUTPUT_DIR"
         print_color "$BLUE" "📁 Created directory: $OUTPUT_DIR"
     fi
-    
-    # Initialize log files
-    > "$ERROR_LOG"
-    > "$SUCCESS_LOG"
-    > "$PROCESS_LOG"
-    
-    print_color "$CYAN" "🔧 Environment setup complete"
 }
 
-# Function to validate JSON response
-validate_json() {
-    local file_path="$1"
-    
-    if [ ! -f "$file_path" ] || [ ! -s "$file_path" ]; then
-        return 1
-    fi
-    
-    # Basic JSON validation
-    if command -v jq >/dev/null 2>&1; then
-        jq empty "$file_path" 2>/dev/null
-    else
-        # Fallback validation without jq
-        grep -q '^{.*}$' "$file_path" 2>/dev/null
-    fi
-}
-
-# Function to fetch single Pokemon data (runs in background)
-fetch_pokemon_background() {
+# Function to fetch single Pokemon data (background process)
+fetch_pokemon() {
     local pokemon_name="$1"
-    local process_id="$$"
     local output_file="${OUTPUT_DIR}/${pokemon_name}.json"
     local api_url="${API_BASE_URL}/${pokemon_name}"
-    local attempt=1
     
-    # Log process start
-    log_message "$PROCESS_LOG" "STARTED - PID:$process_id Pokemon:$pokemon_name"
+    print_color "$CYAN" "Fetching data for ${pokemon_name}..."
     
-    while [ $attempt -le $MAX_RETRIES ]; do
-        log_message "$PROCESS_LOG" "ATTEMPT $attempt - PID:$process_id Pokemon:$pokemon_name"
-        
-        # Make API request with timeout
-        local response
-        local http_code
-        local curl_exit_code
-        
-        response=$(curl -s -S -f \
-            --max-time "$TIMEOUT" \
-            --connect-timeout 10 \
-            -w "%{http_code}" \
-            "$api_url" 2>/dev/null)
-        curl_exit_code=$?
-        
-        # Extract HTTP status code and JSON data
-        if [ ${#response} -ge 3 ]; then
-            http_code="${response: -3}"
-            json_data="${response%???}"
-        else
-            http_code="000"
-            json_data=""
-        fi
-        
-        # Check if request was successful
-        if [ $curl_exit_code -eq 0 ] && [ "$http_code" = "200" ] && [ -n "$json_data" ]; then
-            # Save response to file
-            echo "$json_data" > "$output_file"
-            
-            # Validate JSON
-            if validate_json "$output_file"; then
-                log_message "$SUCCESS_LOG" "SUCCESS - PID:$process_id Pokemon:$pokemon_name File:$output_file"
-                log_message "$PROCESS_LOG" "COMPLETED - PID:$process_id Pokemon:$pokemon_name Status:SUCCESS"
-                
-                # Create success marker file
-                echo "SUCCESS" > "${output_file}.status"
-                exit 0
-            else
-                log_message "$ERROR_LOG" "INVALID_JSON - PID:$process_id Pokemon:$pokemon_name Attempt:$attempt"
-                rm -f "$output_file" 2>/dev/null
-            fi
-        else
-            # Log the specific error
-            local error_msg
-            case $curl_exit_code in
-                0)  error_msg="HTTP_$http_code" ;;
-                6)  error_msg="DNS_RESOLUTION_FAILED" ;;
-                7)  error_msg="CONNECTION_FAILED" ;;
-                22) error_msg="HTTP_ERROR" ;;
-                28) error_msg="TIMEOUT" ;;
-                *)  error_msg="CURL_ERROR_$curl_exit_code" ;;
-            esac
-            
-            log_message "$ERROR_LOG" "$error_msg - PID:$process_id Pokemon:$pokemon_name Attempt:$attempt"
-        fi
-        
-        # Wait before retry (except on last attempt)
-        if [ $attempt -lt $MAX_RETRIES ]; then
-            sleep $((attempt * 2))  # Exponential backoff
-        fi
-        
-        ((attempt++))
-    done
-    
-    # All attempts failed
-    log_message "$ERROR_LOG" "FAILED_ALL_ATTEMPTS - PID:$process_id Pokemon:$pokemon_name"
-    log_message "$PROCESS_LOG" "COMPLETED - PID:$process_id Pokemon:$pokemon_name Status:FAILED"
-    
-    # Create failure marker file
-    echo "FAILED" > "${OUTPUT_DIR}/${pokemon_name}.json.status"
-    exit 1
-}
-
-# Function to start background process for a Pokemon
-start_pokemon_fetch() {
-    local pokemon_name="$1"
-    
-    print_color "$CYAN" "🚀 Starting fetch for: $pokemon_name"
-    
-    # Start background process
-    fetch_pokemon_background "$pokemon_name" &
-    local pid=$!
-    
-    # Store process information
-    PROCESS_PIDS+=($pid)
-    PROCESS_NAMES+=("$pokemon_name")
-    PROCESS_STATUS[$pid]="RUNNING"
-    
-    print_color "$BLUE" "   📋 Process ID: $pid"
-    
-    return 0
-}
-
-# Function to monitor process status
-monitor_processes() {
-    local active_count=0
-    
-    print_color "$YELLOW" "👀 Monitoring active processes..."
-    
-    for i in "${!PROCESS_PIDS[@]}"; do
-        local pid="${PROCESS_PIDS[$i]}"
-        local pokemon_name="${PROCESS_NAMES[$i]}"
-        
-        if kill -0 "$pid" 2>/dev/null; then
-            print_color "$BLUE" "   🔄 PID:$pid ($pokemon_name) - Running"
-            ((active_count++))
-        else
-            if [ "${PROCESS_STATUS[$pid]}" = "RUNNING" ]; then
-                wait "$pid"
-                local exit_code=$?
-                if [ $exit_code -eq 0 ]; then
-                    PROCESS_STATUS[$pid]="SUCCESS"
-                    print_color "$GREEN" "   ✅ PID:$pid ($pokemon_name) - Completed successfully"
-                else
-                    PROCESS_STATUS[$pid]="FAILED"
-                    print_color "$RED" "   ❌ PID:$pid ($pokemon_name) - Failed (exit code: $exit_code)"
-                fi
-            fi
-        fi
-    done
-    
-    return $active_count
-}
-
-# Function to wait for all processes to complete
-wait_for_completion() {
-    print_color "$YELLOW" "⏳ Waiting for all processes to complete..."
-    
-    local max_wait=300  # Maximum wait time in seconds
-    local wait_time=0
-    local check_interval=2
-    
-    while [ $wait_time -lt $max_wait ]; do
-        monitor_processes
-        local active_count=$?
-        
-        if [ $active_count -eq 0 ]; then
-            print_color "$GREEN" "✅ All processes completed!"
-            break
-        fi
-        
-        print_color "$BLUE" "   ⏱️  Active processes: $active_count (waited ${wait_time}s)"
-        sleep $check_interval
-        ((wait_time += check_interval))
-    done
-    
-    if [ $wait_time -ge $max_wait ]; then
-        print_color "$RED" "⚠️  Timeout reached! Some processes may still be running."
-        cleanup_processes
+    # Make API request
+    if curl -s -f "$api_url" -o "$output_file"; then
+        print_color "$GREEN" "Saved data to ${output_file} ✅"
+    else
+        print_color "$RED" "Failed to fetch data for ${pokemon_name} ❌"
+        return 1
     fi
 }
 
-# Function to cleanup any remaining processes
-cleanup_processes() {
-    print_color "$YELLOW" "🧹 Cleaning up processes..."
+# Function to start all background processes
+start_parallel_fetching() {
+    print_color "$YELLOW" "🚀 Starting parallel data fetching..."
     
-    for pid in "${PROCESS_PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            print_color "$YELLOW" "   🛑 Terminating PID: $pid"
-            kill -TERM "$pid" 2>/dev/null
-            sleep 2
-            if kill -0 "$pid" 2>/dev/null; then
-                print_color "$RED" "   💀 Force killing PID: $pid"
-                kill -KILL "$pid" 2>/dev/null
-            fi
-        fi
+    # Start background processes for each Pokemon
+    for pokemon in "${POKEMON_LIST[@]}"; do
+        fetch_pokemon "$pokemon" &
     done
+    
+    print_color "$BLUE" "📊 Started ${#POKEMON_LIST[@]} background processes"
 }
 
-# Function to generate summary report
-generate_summary() {
+# Function to monitor and wait for all jobs to complete
+wait_for_all_jobs() {
+    print_color "$YELLOW" "⏳ Waiting for all background processes to complete..."
+    
+    # Show current jobs
+    print_color "$BLUE" "📋 Current background jobs:"
+    jobs
+    
+    # Wait for all background jobs to complete
+    while [ $(jobs -r | wc -l) -gt 0 ]; do
+        print_color "$CYAN" "   Active jobs: $(jobs -r | wc -l)"
+        jobs -l
+        sleep 2
+    done
+    
+    # Wait for all background processes
+    wait
+    
+    print_color "$GREEN" "✅ All background processes completed!"
+}
+
+# Function to display results
+show_results() {
     local successful=0
     local failed=0
-    local total=${#POKEMON_LIST[@]}
     
-    print_color "$CYAN" "📊 PARALLEL PROCESSING SUMMARY"
+    print_color "$CYAN" "📊 PARALLEL PROCESSING RESULTS"
     print_color "$CYAN" "=============================="
     
-    # Count results
     for pokemon in "${POKEMON_LIST[@]}"; do
-        local status_file="${OUTPUT_DIR}/${pokemon}.json.status"
         local json_file="${OUTPUT_DIR}/${pokemon}.json"
         
-        if [ -f "$status_file" ]; then
-            local status=$(cat "$status_file")
-            if [ "$status" = "SUCCESS" ] && [ -f "$json_file" ]; then
-                ((successful++))
-                local file_size=$(stat -f%z "$json_file" 2>/dev/null || stat -c%s "$json_file" 2>/dev/null || echo "unknown")
-                print_color "$GREEN" "✅ $pokemon - Success ($file_size bytes)"
-            else
-                ((failed++))
-                print_color "$RED" "❌ $pokemon - Failed"
-            fi
+        if [ -f "$json_file" ] && [ -s "$json_file" ]; then
+            ((successful++))
+            local file_size=$(stat -f%z "$json_file" 2>/dev/null || stat -c%s "$json_file" 2>/dev/null || echo "unknown")
+            print_color "$GREEN" "✅ $pokemon - Success ($file_size bytes)"
         else
             ((failed++))
-            print_color "$RED" "❌ $pokemon - No status file"
+            print_color "$RED" "❌ $pokemon - Failed"
         fi
     done
     
     echo ""
-    print_color "$BLUE" "📈 Statistics:"
-    print_color "$GREEN" "   Successful: $successful/$total"
-    print_color "$RED" "   Failed: $failed/$total"
-    print_color "$PURPLE" "   Success Rate: $(( successful * 100 / total ))%"
+    print_color "$BLUE" "📈 Summary:"
+    print_color "$GREEN" "   Successful: $successful/${#POKEMON_LIST[@]}"
+    print_color "$RED" "   Failed: $failed/${#POKEMON_LIST[@]}"
     
-    # Show timing information if available
-    if [ -f "$PROCESS_LOG" ]; then
-        local start_time=$(head -n1 "$PROCESS_LOG" | cut -d']' -f1 | tr -d '[')
-        local end_time=$(tail -n1 "$PROCESS_LOG" | cut -d']' -f1 | tr -d '[')
-        print_color "$BLUE" "   Start Time: $start_time"
-        print_color "$BLUE" "   End Time: $end_time"
-    fi
-    
-    # Show file locations
     if [ $successful -gt 0 ]; then
         echo ""
-        print_color "$BLUE" "📁 Output files in: $OUTPUT_DIR/"
-        ls -la "$OUTPUT_DIR"/*.json 2>/dev/null | while read -r line; do
-            echo "   $line"
-        done
+        print_color "$BLUE" "📁 Output files:"
+        ls -la "$OUTPUT_DIR"/*.json 2>/dev/null
     fi
+}
+
+# Function to handle script interruption
+cleanup() {
+    print_color "$YELLOW" "\n🛑 Script interrupted! Cleaning up background jobs..."
     
-    # Show log files
-    echo ""
-    print_color "$BLUE" "📝 Log files:"
-    [ -f "$SUCCESS_LOG" ] && print_color "$GREEN" "   Success log: $SUCCESS_LOG"
-    [ -f "$ERROR_LOG" ] && print_color "$RED" "   Error log: $ERROR_LOG"
-    [ -f "$PROCESS_LOG" ] && print_color "$BLUE" "   Process log: $PROCESS_LOG"
-}
-
-# Function to display usage
-show_usage() {
-    echo "Usage: $0 [options]"
-    echo ""
-    echo "Options:"
-    echo "  -h, --help              Show this help message"
-    echo "  -c, --concurrent NUM    Maximum concurrent processes (default: $MAX_CONCURRENT)"
-    echo "  -t, --timeout SEC       Request timeout in seconds (default: $TIMEOUT)"
-    echo "  -r, --retries NUM       Maximum retry attempts (default: $MAX_RETRIES)"
-    echo "  -o, --output DIR        Output directory (default: $OUTPUT_DIR)"
-    echo "  -v, --verbose           Enable verbose output"
-    echo "  --clean                 Clean output directory before starting"
-    echo "  --monitor               Show real-time process monitoring"
-    echo ""
-    echo "This script fetches Pokemon data in parallel using background processes"
-    echo "for improved performance and efficiency."
-}
-
-# Function to clean output directory
-clean_output() {
-    if [ -d "$OUTPUT_DIR" ]; then
-        print_color "$YELLOW" "🧹 Cleaning output directory..."
-        rm -rf "$OUTPUT_DIR"/*
-        print_color "$GREEN" "✅ Output directory cleaned"
-    fi
-}
-
-# Signal handler for cleanup
-signal_handler() {
-    print_color "$YELLOW" "\n🛑 Script interrupted! Cleaning up..."
-    cleanup_processes
+    # Kill all background jobs
+    jobs -p | xargs -r kill 2>/dev/null
+    
     exit 130
 }
 
 # Main execution function
 main() {
-    local verbose=false
-    local monitor_mode=false
+    # Set up signal handler
+    trap cleanup SIGINT SIGTERM
     
-    # Set up signal handlers
-    trap signal_handler SIGINT SIGTERM
-    
-    # Parse command line arguments
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            -h|--help)
-                show_usage
-                exit 0
-                ;;
-            -c|--concurrent)
-                MAX_CONCURRENT="$2"
-                shift 2
-                ;;
-            -t|--timeout)
-                TIMEOUT="$2"
-                shift 2
-                ;;
-            -r|--retries)
-                MAX_RETRIES="$2"
-                shift 2
-                ;;
-            -o|--output)
-                OUTPUT_DIR="$2"
-                shift 2
-                ;;
-            -v|--verbose)
-                verbose=true
-                shift
-                ;;
-            --clean)
-                clean_output
-                exit 0
-                ;;
-            --monitor)
-                monitor_mode=true
-                shift
-                ;;
-            *)
-                print_color "$RED" "❌ Unknown option: $1"
-                show_usage
-                exit 1
-                ;;
-        esac
-    done
-    
-    # Display script header
-    print_color "$PURPLE" "🚀 Parallel Pokemon Data Fetching"
-    print_color "$PURPLE" "================================="
-    print_color "$BLUE" "📋 Pokemon to fetch: ${#POKEMON_LIST[@]} (${POKEMON_LIST[*]})"
-    print_color "$BLUE" "🔄 Max concurrent processes: $MAX_CONCURRENT"
-    print_color "$BLUE" "⏰ Request timeout: ${TIMEOUT}s"
-    print_color "$BLUE" "🔁 Max retries per Pokemon: $MAX_RETRIES"
+    # Display header
+    print_color "$CYAN" "🚀 Parallel Pokemon Data Fetching"
+    print_color "$CYAN" "================================="
+    print_color "$BLUE" "📋 Pokemon to fetch: ${POKEMON_LIST[*]}"
     print_color "$BLUE" "📁 Output directory: $OUTPUT_DIR"
     echo ""
     
@@ -424,54 +147,28 @@ main() {
     
     # Record start time
     local start_time=$(date +%s)
-    log_message "$PROCESS_LOG" "BATCH_START - Total:${#POKEMON_LIST[@]} MaxConcurrent:$MAX_CONCURRENT"
     
-    # Start parallel processes
-    print_color "$CYAN" "🎯 Starting parallel data fetching..."
-    echo ""
-    
-    for pokemon in "${POKEMON_LIST[@]}"; do
-        start_pokemon_fetch "$pokemon"
-        
-        # Control concurrency
-        if [ ${#PROCESS_PIDS[@]} -ge $MAX_CONCURRENT ]; then
-            print_color "$YELLOW" "⏸️  Reached max concurrent processes, waiting..."
-            wait_for_completion
-            # Reset arrays for next batch
-            PROCESS_PIDS=()
-            PROCESS_NAMES=()
-            declare -A PROCESS_STATUS=()
-        fi
-        
-        # Small delay to prevent overwhelming the API
-        sleep 0.5
-    done
+    # Start parallel fetching
+    start_parallel_fetching
     
     echo ""
     
-    # Wait for all remaining processes
-    if [ ${#PROCESS_PIDS[@]} -gt 0 ]; then
-        wait_for_completion
-    fi
+    # Wait for all jobs to complete
+    wait_for_all_jobs
     
-    # Calculate total time
+    # Calculate execution time
     local end_time=$(date +%s)
     local total_time=$((end_time - start_time))
     
-    log_message "$PROCESS_LOG" "BATCH_END - Duration:${total_time}s"
-    
     echo ""
-    print_color "$CYAN" "⏱️  Total execution time: ${total_time} seconds"
+    print_color "$BLUE" "⏱️  Total execution time: ${total_time} seconds"
     
-    # Generate summary report
+    # Show results
     echo ""
-    generate_summary
-    
-    # Cleanup status files
-    rm -f "$OUTPUT_DIR"/*.status 2>/dev/null
+    show_results
     
     print_color "$GREEN" "🎉 Parallel processing completed!"
 }
 
-# Execute main function with all arguments
+# Execute main function
 main "$@"
