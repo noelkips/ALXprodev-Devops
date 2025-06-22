@@ -1,0 +1,409 @@
+#!/bin/bash
+
+# Enhanced Batch Pokémon Data Retrieval with Robust Error Handling
+# Implements retry logic, comprehensive error handling, and recovery mechanisms
+
+# Configuration
+POKEMON_LIST=("bulbasaur" "ivysaur" "venusaur" "charmander" "charmeleon")
+API_BASE_URL="https://pokeapi.co/api/v2/pokemon"
+OUTPUT_DIR="pokemon_data"
+ERROR_LOG="batch_errors.txt"
+SUCCESS_LOG="batch_success.txt"
+DELAY_BETWEEN_REQUESTS=1
+MAX_RETRIES=3
+TIMEOUT=30
+RETRY_DELAY_BASE=2  # Base delay for exponential backoff
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Function to print colored output
+print_color() {
+    local color=$1
+    local message=$2
+    echo -e "${color}${message}${NC}"
+}
+
+# Enhanced error logging with categorization
+log_error() {
+    local pokemon_name="$1"
+    local error_type="$2"
+    local error_message="$3"
+    local attempt="$4"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] $error_type - $pokemon_name (attempt $attempt): $error_message" >> "$ERROR_LOG"
+}
+
+# Success logging
+log_success() {
+    local pokemon_name="$1"
+    local file_path="$2"
+    local attempts="$3"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local file_size=$(stat -f%z "$file_path" 2>/dev/null || stat -c%s "$file_path" 2>/dev/null || echo "unknown")
+    echo "[$timestamp] SUCCESS - $pokemon_name: Saved to $file_path ($file_size bytes) after $attempts attempt(s)" >> "$SUCCESS_LOG"
+}
+
+# Function to validate Pokémon name
+validate_pokemon_name() {
+    local pokemon_name="$1"
+    
+    # Check for empty name
+    if [ -z "$pokemon_name" ]; then
+        return 1
+    fi
+    
+    # Check for valid characters (letters, numbers, hyphens only)
+    if [[ ! "$pokemon_name" =~ ^[a-zA-Z0-9-]+$ ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check network connectivity
+check_network_connectivity() {
+    local test_url="https://pokeapi.co"
+    
+    if curl -s --connect-timeout 5 --max-time 10 "$test_url" >/dev/null 2>&1; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function to analyze curl error and provide specific error handling
+analyze_curl_error() {
+    local exit_code="$1"
+    local http_code="$2"
+    local pokemon_name="$3"
+    
+    case $exit_code in
+        0)
+            case $http_code in
+                200) echo "SUCCESS" ;;
+                404) echo "POKEMON_NOT_FOUND:Pokemon '$pokemon_name' not found in API" ;;
+                429) echo "RATE_LIMITED:API rate limit exceeded" ;;
+                500|502|503|504) echo "SERVER_ERROR:API server error (HTTP $http_code)" ;;
+                *) echo "HTTP_ERROR:HTTP error $http_code" ;;
+            esac
+            ;;
+        6) echo "DNS_ERROR:Could not resolve hostname - check DNS settings" ;;
+        7) echo "CONNECTION_ERROR:Failed to connect to server - check internet connection" ;;
+        22) echo "HTTP_ERROR:HTTP request failed" ;;
+        28) echo "TIMEOUT_ERROR:Request timed out after ${TIMEOUT}s" ;;
+        35) echo "SSL_ERROR:SSL/TLS connection error" ;;
+        52) echo "SERVER_ERROR:Server returned empty response" ;;
+        56) echo "NETWORK_ERROR:Network receive error" ;;
+        *) echo "CURL_ERROR:Curl failed with exit code $exit_code" ;;
+    esac
+}
+
+# Function to calculate retry delay with exponential backoff
+calculate_retry_delay() {
+    local attempt="$1"
+    local base_delay="$RETRY_DELAY_BASE"
+    
+    # Exponential backoff: 2^(attempt-1) seconds, max 16 seconds
+    local delay=$((base_delay ** (attempt - 1)))
+    if [ $delay -gt 16 ]; then
+        delay=16
+    fi
+    
+    echo $delay
+}
+
+# Enhanced JSON validation
+validate_json_response() {
+    local json_data="$1"
+    local pokemon_name="$2"
+    
+    # Check if response is empty
+    if [ -z "$json_data" ]; then
+        echo "EMPTY_RESPONSE:Received empty response"
+        return 1
+    fi
+    
+    # Check if response contains error message
+    if echo "$json_data" | grep -q '"detail".*"Not found"'; then
+        echo "POKEMON_NOT_FOUND:Pokemon '$pokemon_name' not found"
+        return 1
+    fi
+    
+    # Basic JSON structure validation
+    if ! echo "$json_data" | grep -q '^{.*}$'; then
+        echo "INVALID_JSON:Response is not valid JSON"
+        return 1
+    fi
+    
+    # Check for required fields using basic grep (fallback if jq not available)
+    if command -v jq >/dev/null 2>&1; then
+        if ! echo "$json_data" | jq -e '.name and .height and .weight' >/dev/null 2>&1; then
+            echo "MISSING_FIELDS:Required fields (name, height, weight) missing"
+            return 1
+        fi
+    else
+        # Basic validation without jq
+        if ! echo "$json_data" | grep -q '"name"' || \
+           ! echo "$json_data" | grep -q '"height"' || \
+           ! echo "$json_data" | grep -q '"weight"'; then
+            echo "MISSING_FIELDS:Required fields missing (basic check)"
+            return 1
+        fi
+    fi
+    
+    echo "VALID"
+    return 0
+}
+
+# Enhanced fetch function with comprehensive retry logic
+fetch_pokemon_data_with_retry() {
+    local pokemon_name="$1"
+    local output_file="${OUTPUT_DIR}/${pokemon_name}.json"
+    local api_url="${API_BASE_URL}/${pokemon_name}"
+    local attempt=1
+    local success=false
+    
+    # Validate Pokemon name first
+    if ! validate_pokemon_name "$pokemon_name"; then
+        log_error "$pokemon_name" "VALIDATION_ERROR" "Invalid Pokemon name format" "0"
+        print_color "$RED" "❌ Invalid Pokemon name: $pokemon_name"
+        return 1
+    fi
+    
+    print_color "$CYAN" "Fetching data for ${pokemon_name}..."
+    
+    # Retry loop
+    while [ $attempt -le $MAX_RETRIES ] && [ "$success" = false ]; do
+        print_color "$BLUE" "   📡 Attempt $attempt/$MAX_RETRIES"
+        
+        # Check network connectivity before attempting
+        if [ $attempt -eq 1 ] && ! check_network_connectivity; then
+            log_error "$pokemon_name" "NETWORK_ERROR" "No network connectivity detected" "$attempt"
+            print_color "$RED" "   ❌ Network connectivity check failed"
+            return 1
+        fi
+        
+        # Make API request with detailed error capture
+        local response
+        local http_code
+        local curl_exit_code
+        local temp_error_file="/tmp/curl_error_$$"
+        
+        response=$(curl -s -S -f \
+            --max-time "$TIMEOUT" \
+            --connect-timeout 10 \
+            --retry 0 \
+            -w "%{http_code}" \
+            "$api_url" 2>"$temp_error_file")
+        curl_exit_code=$?
+        
+        # Extract HTTP code and JSON data
+        if [ ${#response} -ge 3 ]; then
+            http_code="${response: -3}"
+            json_data="${response%???}"
+        else
+            http_code="000"
+            json_data=""
+        fi
+        
+        # Analyze the error
+        local error_analysis=$(analyze_curl_error "$curl_exit_code" "$http_code" "$pokemon_name")
+        local error_type="${error_analysis%%:*}"
+        local error_message="${error_analysis#*:}"
+        
+        # Handle success case
+        if [ "$error_type" = "SUCCESS" ]; then
+            # Validate JSON response
+            local validation_result=$(validate_json_response "$json_data" "$pokemon_name")
+            local validation_type="${validation_result%%:*}"
+            
+            if [ "$validation_type" = "VALID" ]; then
+                # Save successful response
+                echo "$json_data" > "$output_file"
+                log_success "$pokemon_name" "$output_file" "$attempt"
+                print_color "$GREEN" "   ✅ Saved data to ${output_file}"
+                success=true
+                
+                # Display basic info if jq available
+                if command -v jq >/dev/null 2>&1; then
+                    local poke_id=$(echo "$json_data" | jq -r '.id // "N/A"')
+                    local base_exp=$(echo "$json_data" | jq -r '.base_experience // "N/A"')
+                    print_color "$PURPLE" "      ID: $poke_id | Base Experience: $base_exp"
+                fi
+            else
+                local validation_message="${validation_result#*:}"
+                log_error "$pokemon_name" "VALIDATION_ERROR" "$validation_message" "$attempt"
+                print_color "$YELLOW" "   ⚠️  Validation failed: $validation_message"
+            fi
+        else
+            # Handle different error types
+            log_error "$pokemon_name" "$error_type" "$error_message" "$attempt"
+            
+            case $error_type in
+                POKEMON_NOT_FOUND)
+                    print_color "$RED" "   ❌ Pokemon not found: $pokemon_name"
+                    break  # Don't retry for 404 errors
+                    ;;
+                RATE_LIMITED)
+                    print_color "$YELLOW" "   ⚠️  Rate limited, increasing delay..."
+                    local extra_delay=$((attempt * 5))
+                    sleep $extra_delay
+                    ;;
+                DNS_ERROR|CONNECTION_ERROR|NETWORK_ERROR)
+                    print_color "$YELLOW" "   ⚠️  Network issue: $error_message"
+                    ;;
+                TIMEOUT_ERROR)
+                    print_color "$YELLOW" "   ⚠️  Request timeout, retrying..."
+                    ;;
+                *)
+                    print_color "$YELLOW" "   ⚠️  $error_message"
+                    ;;
+            esac
+        fi
+        
+        # Clean up temp error file
+        [ -f "$temp_error_file" ] && rm "$temp_error_file"
+        
+        # If not successful and more attempts available, wait before retry
+        if [ "$success" = false ] && [ $attempt -lt $MAX_RETRIES ]; then
+            local retry_delay=$(calculate_retry_delay $attempt)
+            print_color "$YELLOW" "   ⏳ Waiting ${retry_delay}s before retry..."
+            sleep $retry_delay
+        fi
+        
+        ((attempt++))
+    done
+    
+    # Final result
+    if [ "$success" = true ]; then
+        return 0
+    else
+        print_color "$RED" "   ❌ Failed after $MAX_RETRIES attempts"
+        return 1
+    fi
+}
+
+# Function to setup directories and logs
+setup_environment() {
+    if [ ! -d "$OUTPUT_DIR" ]; then
+        mkdir -p "$OUTPUT_DIR"
+        print_color "$BLUE" "📁 Created directory: $OUTPUT_DIR"
+    fi
+    
+    # Initialize log files
+    > "$ERROR_LOG"
+    > "$SUCCESS_LOG"
+    > "${OUTPUT_DIR}/batch_log.txt"
+}
+
+# Function to display comprehensive summary
+show_enhanced_summary() {
+    local successful=$1
+    local failed=$2
+    local total=$3
+    
+    echo ""
+    print_color "$CYAN" "📋 ENHANCED BATCH PROCESSING SUMMARY"
+    print_color "$CYAN" "===================================="
+    print_color "$GREEN" "✅ Successful: $successful/$total"
+    print_color "$RED" "❌ Failed: $failed/$total"
+    
+    # Calculate success rate
+    local success_rate=0
+    if [ $total -gt 0 ]; then
+        success_rate=$((successful * 100 / total))
+    fi
+    print_color "$BLUE" "📊 Success Rate: ${success_rate}%"
+    
+    # Show error breakdown if errors occurred
+    if [ $failed -gt 0 ] && [ -f "$ERROR_LOG" ]; then
+        print_color "$YELLOW" "📊 Error Analysis:"
+        echo "   $(grep -c "NETWORK_ERROR" "$ERROR_LOG" 2>/dev/null || echo 0) Network errors"
+        echo "   $(grep -c "TIMEOUT_ERROR" "$ERROR_LOG" 2>/dev/null || echo 0) Timeout errors"
+        echo "   $(grep -c "POKEMON_NOT_FOUND" "$ERROR_LOG" 2>/dev/null || echo 0) Pokemon not found"
+        echo "   $(grep -c "RATE_LIMITED" "$ERROR_LOG" 2>/dev/null || echo 0) Rate limit errors"
+        echo "   $(grep -c "VALIDATION_ERROR" "$ERROR_LOG" 2>/dev/null || echo 0) Validation errors"
+    fi
+    
+    # Show file information
+    if [ $successful -gt 0 ]; then
+        print_color "$BLUE" "📁 Generated files:"
+        ls -la "$OUTPUT_DIR"/*.json 2>/dev/null | while read -r line; do
+            echo "   $line"
+        done
+        
+        if command -v du >/dev/null 2>&1; then
+            local total_size=$(du -sh "$OUTPUT_DIR" 2>/dev/null | cut -f1)
+            print_color "$PURPLE" "💾 Total data size: $total_size"
+        fi
+    fi
+    
+    print_color "$BLUE" "📄 Logs generated:"
+    echo "   Success log: $SUCCESS_LOG"
+    echo "   Error log: $ERROR_LOG"
+}
+
+# Main execution with enhanced error handling
+main() {
+    local successful=0
+    local failed=0
+    local total=${#POKEMON_LIST[@]}
+    local current=0
+    
+    # Display header
+    print_color "$PURPLE" "🚀 Enhanced Batch Pokemon Data Retrieval"
+    print_color "$PURPLE" "========================================"
+    print_color "$BLUE" "📋 Pokemon to fetch: $total"
+    print_color "$BLUE" "🔄 Max retries per Pokemon: $MAX_RETRIES"
+    print_color "$BLUE" "⏰ Request timeout: ${TIMEOUT}s"
+    print_color "$BLUE" "⏱️  Delay between requests: ${DELAY_BETWEEN_REQUESTS}s"
+    echo ""
+    
+    # Setup environment
+    setup_environment
+    
+    # Process each Pokemon
+    for pokemon in "${POKEMON_LIST[@]}"; do
+        ((current++))
+        print_color "$BLUE" "📊 Progress: [$current/$total] - Processing: $pokemon"
+        
+        if fetch_pokemon_data_with_retry "$pokemon"; then
+            ((successful++))
+        else
+            ((failed++))
+        fi
+        
+        # Add delay between requests (except for the last one)
+        if [ $current -lt $total ]; then
+            print_color "$YELLOW" "   ⏳ Waiting ${DELAY_BETWEEN_REQUESTS}s..."
+            sleep "$DELAY_BETWEEN_REQUESTS"
+        fi
+        
+        echo ""
+    done
+    
+    # Display comprehensive summary
+    show_enhanced_summary $successful $failed $total
+    
+    # Exit with appropriate code
+    if [ $failed -eq 0 ]; then
+        print_color "$GREEN" "🎉 All Pokemon data retrieved successfully!"
+        exit 0
+    elif [ $successful -gt 0 ]; then
+        print_color "$YELLOW" "⚠️  Partial success: $successful/$total Pokemon retrieved"
+        exit 2
+    else
+        print_color "$RED" "💥 Complete failure: No Pokemon data retrieved"
+        exit 1
+    fi
+}
+
+# Execute main function
+main "$@"

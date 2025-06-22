@@ -1,0 +1,186 @@
+#!/bin/bash
+
+# API Request Automation Script for Pokémon API
+# Fetches Pikachu data and saves to data.json
+# Logs errors to errors.txt if request fails
+
+# Configuration
+POKEMON_NAME="pikachu"
+API_URL="https://pokeapi.co/api/v2/pokemon/${POKEMON_NAME}"
+OUTPUT_FILE="data.json"
+ERROR_FILE="errors.txt"
+
+# Function to log errors with timestamp
+log_error() {
+    local error_message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] ERROR: $error_message" >> "$ERROR_FILE"
+}
+
+# Function to make API request
+fetch_pokemon_data() {
+    echo "Fetching Pokémon data for: $POKEMON_NAME"
+    echo "API URL: $API_URL"
+    
+    # Make the API request using curl
+    # -s: silent mode (no progress bar)
+    # -S: show errors even in silent mode
+    # -f: fail silently on HTTP errors
+    # -w: write response code to check success
+    local http_code
+    local response
+    
+    response=$(curl -s -S -f -w "%{http_code}" "$API_URL" 2>/dev/null)
+    local curl_exit_code=$?
+    
+    # Extract HTTP status code (last 3 characters)
+    http_code="${response: -3}"
+    # Extract JSON response (everything except last 3 characters)
+    local json_data="${response%???}"
+    
+    # Check if curl command was successful
+    if [ $curl_exit_code -eq 0 ] && [ "$http_code" = "200" ]; then
+        # Save successful response to data.json
+        echo "$json_data" > "$OUTPUT_FILE"
+        echo "✅ Success! Pokémon data saved to $OUTPUT_FILE"
+        echo "📊 Data size: $(wc -c < "$OUTPUT_FILE") bytes"
+        return 0
+    else
+        # Handle different types of errors
+        if [ $curl_exit_code -ne 0 ]; then
+            case $curl_exit_code in
+                6)  error_msg="Could not resolve host - check internet connection" ;;
+                7)  error_msg="Failed to connect to API server" ;;
+                22) error_msg="HTTP error - Pokemon not found or API unavailable" ;;
+                28) error_msg="Request timeout" ;;
+                *)  error_msg="Curl failed with exit code: $curl_exit_code" ;;
+            esac
+        else
+            error_msg="HTTP $http_code - API request failed"
+        fi
+        
+        log_error "$error_msg"
+        echo "❌ Error: $error_msg"
+        echo "🔍 Check $ERROR_FILE for detailed error log"
+        return 1
+    fi
+}
+
+# Function to validate JSON output
+validate_json() {
+    if [ -f "$OUTPUT_FILE" ]; then
+        # Check if jq is available for JSON validation
+        if command -v jq >/dev/null 2>&1; then
+            if jq empty "$OUTPUT_FILE" 2>/dev/null; then
+                echo "✅ JSON validation successful"
+                echo "🔍 Preview of fetched data:"
+                echo "----------------------------------------"
+                jq -r '.name // "N/A"' "$OUTPUT_FILE" | sed 's/^/   Name: /'
+                jq -r '.base_experience // "N/A"' "$OUTPUT_FILE" | sed 's/^/   Base Experience: /'
+                jq -r '.height // "N/A"' "$OUTPUT_FILE" | sed 's/^/   Height: /'
+                jq -r '.weight // "N/A"' "$OUTPUT_FILE" | sed 's/^/   Weight: /'
+                echo "----------------------------------------"
+                return 0
+            else
+                log_error "Invalid JSON format in response"
+                echo "❌ Error: Invalid JSON format received"
+                return 1
+            fi
+        else
+            echo "⚠️  Warning: jq not available for JSON validation"
+            echo "💡 Install jq with: sudo apt-get install jq (Ubuntu/Debian)"
+        fi
+    else
+        log_error "Output file $OUTPUT_FILE not found"
+        echo "❌ Error: Output file not created"
+        return 1
+    fi
+}
+
+# Function to display usage information
+show_usage() {
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  -h, --help     Show this help message"
+    echo "  -v, --verbose  Enable verbose output"
+    echo "  -c, --clean    Clean previous data and error files"
+    echo ""
+    echo "This script fetches Pokémon data for Pikachu from the PokéAPI"
+    echo "and saves it to $OUTPUT_FILE. Errors are logged to $ERROR_FILE."
+}
+
+# Function to clean previous files
+clean_files() {
+    echo "🧹 Cleaning previous files..."
+    [ -f "$OUTPUT_FILE" ] && rm "$OUTPUT_FILE" && echo "   Removed $OUTPUT_FILE"
+    [ -f "$ERROR_FILE" ] && rm "$ERROR_FILE" && echo "   Removed $ERROR_FILE"
+    echo "✅ Cleanup complete"
+}
+
+# Main execution function
+main() {
+    local verbose=false
+    
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--verbose)
+                verbose=true
+                shift
+                ;;
+            -c|--clean)
+                clean_files
+                exit 0
+                ;;
+            *)
+                echo "❌ Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Display script header
+    echo "🚀 Pokémon API Request Automation"
+    echo "=================================="
+    
+    # Check for required tools
+    if ! command -v curl >/dev/null 2>&1; then
+        log_error "curl is not installed"
+        echo "❌ Error: curl is required but not installed"
+        echo "💡 Install curl with: sudo apt-get install curl (Ubuntu/Debian)"
+        exit 1
+    fi
+    
+    # Make the API request
+    if fetch_pokemon_data; then
+        # Validate the JSON response
+        validate_json
+        
+        # Display success summary
+        echo ""
+        echo "🎉 API request completed successfully!"
+        echo "📁 Output file: $OUTPUT_FILE"
+        
+        if [ "$verbose" = true ]; then
+            echo ""
+            echo "📋 File details:"
+            ls -lh "$OUTPUT_FILE" 2>/dev/null || echo "   Could not get file details"
+        fi
+        
+        exit 0
+    else
+        echo ""
+        echo "💥 API request failed!"
+        echo "📁 Error log: $ERROR_FILE"
+        exit 1
+    fi
+}
+
+# Execute main function with all arguments
+main "$@"

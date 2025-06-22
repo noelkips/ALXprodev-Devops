@@ -1,0 +1,55 @@
+#!/bin/bash
+
+# API Request Automation Script
+# Fetches Pikachu data from Pokemon API and saves to data.json
+# Logs errors to errors.txt if request fails
+
+# Configuration
+POKEMON_NAME="pikachu"
+API_URL="https://pokeapi.co/api/v2/pokemon/${POKEMON_NAME}"
+OUTPUT_FILE="data.json"
+ERROR_FILE="errors.txt"
+
+# Function to log errors with timestamp
+log_error() {
+    local error_message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] ERROR: $error_message" >> "$ERROR_FILE"
+}
+
+# Make API request and handle response
+echo "Fetching Pokemon data for: $POKEMON_NAME"
+
+# Use curl to make the API request
+response=$(curl -s -w "%{http_code}" "$API_URL" 2>/dev/null)
+curl_exit_code=$?
+
+# Extract HTTP status code (last 3 characters)
+http_code="${response: -3}"
+# Extract JSON response (everything except last 3 characters)
+json_data="${response%???}"
+
+# Check if request was successful
+if [ $curl_exit_code -eq 0 ] && [ "$http_code" = "200" ]; then
+    # Save successful response to data.json
+    echo "$json_data" > "$OUTPUT_FILE"
+    echo "Success! Pokemon data saved to $OUTPUT_FILE"
+else
+    # Handle errors
+    if [ $curl_exit_code -ne 0 ]; then
+        case $curl_exit_code in
+            6)  error_msg="Could not resolve host - check internet connection" ;;
+            7)  error_msg="Failed to connect to API server" ;;
+            22) error_msg="HTTP error - Pokemon not found or API unavailable" ;;
+            28) error_msg="Request timeout" ;;
+            *)  error_msg="Curl failed with exit code: $curl_exit_code" ;;
+        esac
+    else
+        error_msg="HTTP $http_code - API request failed"
+    fi
+    
+    log_error "$error_msg"
+    echo "Error: $error_msg"
+    echo "Check $ERROR_FILE for details"
+    exit 1
+fi
